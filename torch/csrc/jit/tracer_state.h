@@ -30,26 +30,11 @@ namespace torch { namespace jit { namespace tracer {
 // from arising when a variable that participated in a trace outlives the
 // actual trace itself.
 
-struct TracingState : public std::enable_shared_from_this<TracingState> {
-  TracingState();
-  ~TracingState();
-
-  std::shared_ptr<Graph> graph;
-  std::mutex mutex;
-  bool active;
-
-  std::unique_lock<std::mutex> lock() {
-    return std::unique_lock<std::mutex>(mutex);
-  }
-};
-
 struct ValueTracingStateElem {
-  std::weak_ptr<TracingState> state;
   // it's only valid to use this field if !state.exired()
   Value* trace = nullptr;
 
   void reset() {
-    state.reset();
     trace = nullptr;
   }
 };

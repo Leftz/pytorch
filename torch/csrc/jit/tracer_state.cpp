@@ -3,10 +3,4 @@
 
 namespace torch { namespace jit { namespace tracer {
 
-TracingState::TracingState()
-    : graph(new Graph())
-    , active(true) {}
-
-TracingState::~TracingState() = default;
-
 }}} // namespace torch::jit::tracer

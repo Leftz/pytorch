@@ -17,39 +17,34 @@
 
 namespace torch { namespace jit { namespace tracer {
 
+using at::WeakTensor;
 using torch::autograd::Variable;
 using variable_list = std::vector<Variable>;
 
+struct TracingState : public std::enable_shared_from_this<TracingState> {
+  TracingState();
+  ~TracingState();
+
+  struct WeakTensorHasher {
+    size_t operator()(const WeakTensor& t) const {
+      return std::hash<void*>()(t.unsafeGetTensorImpl());
+    }
+  };
+
+  struct WeakTensorEq {
+    bool operator()(const WeakTensor& t1, const WeakTensor& t2) const {
+      return t1.unsafeGetTensorImpl() == t2.unsafeGetTensorImpl();
+    }
+  };
+
+  std::unordered_map<WeakTensor, Value*, WeakTensorHasher, WeakTensorEq> value_map;
+  std::shared_ptr<Graph> graph;
+};
+
+
 namespace detail {
 
-inline ValueTracingStateElem* getValueState(const std::shared_ptr<TracingState>& state, const Variable& var, bool alloc = true) {
-  auto& tracing_state = var.tracing_state();
-  for (auto it = tracing_state.begin(); it != tracing_state.end();) {
-    auto ts = it->state.lock();
-    // GC of invalidated tracing states
-    if (!ts) {
-      auto current_it = it++;
-      tracing_state.erase(current_it);
-      continue;
-    } else if (ts == state) {
-      return &(*it);
-    }
-    ++it;
-  }
-  if (alloc) {
-    tracing_state.emplace_front();
-    auto & vts = tracing_state.front();
-    vts.state = state;
-    return &vts;
-  } else {
-    return nullptr;
-  }
-}
-
-inline bool isElemActive(const ValueTracingStateElem& vts) {
-  auto state = vts.state.lock();
-  return state && state->active;
-}
+thread_local std::shared_ptr<TracingState> tracing_state;
 
 } // namespace detail
 
@@ -101,31 +96,17 @@ private:
 // need it (in most cases if we have a variable_list it is already
 // flattened).
 inline bool isTracingVar(const Variable& var) {
-  if (!var.defined() || !var.has_tracing_state()) return false;
-  return std::any_of(var.tracing_state().begin(), var.tracing_state().end(), detail::isElemActive);
+  return static_cast<bool>(detail::tracing_state);
 }
 
 inline bool isTracingVar(at::ArrayRef<Variable> vars) {
-  // Reference to avoid refcount bump
-  for (const Variable& var : vars) {
-    if (isTracingVar(var)) return true;
-  }
-  return false;
+  return static_cast<bool>(detail::tracing_state);
 }
-
-struct IsTracing : IterArgs<IsTracing> {
-  bool out = false;
-  using IterArgs<IsTracing>::operator();
-  void operator()(const at::Tensor& var) {
-    out = out || isTracingVar(var);
-  }
-  bool short_circuit() { return out; }
-};
 
 // To be called with Tensor arguments from generated code
 template<typename... Args>
 inline bool isTracing(Args&&... args) {
-  return IsTracing().apply(std::forward<Args>(args)...).out;
+  return static_cast<bool>(detail::tracing_state);
 }
 
 // Retrieve the tracing state which a function applied with 'vars' should
@@ -133,18 +114,8 @@ inline bool isTracing(Args&&... args) {
 // we don't support mixing up variables from different traces; this code
 // will need to be revisited if that ever becomes supported.
 inline std::shared_ptr<TracingState> getTracingState(const variable_list& vars) {
-  std::shared_ptr<TracingState> state;
-  for (auto& var : vars) {
-    if (!var.defined() || !var.has_tracing_state()) continue;
-    for (auto & vts : var.tracing_state()) {
-      auto var_state = vts.state.lock();
-      if (!var_state || !var_state->active) continue;
-      if (!state) state = var_state;
-      JIT_ASSERT(var_state == state);
-    }
-  }
-  JIT_ASSERT(state);
-  return state;
+  JIT_ASSERT(detail::tracing_state);
+  return detail::tracing_state;
 }
 
 // Having finished adding a new 'node' to the graph IR owned by TracingState 'state',
@@ -152,8 +123,7 @@ inline std::shared_ptr<TracingState> getTracingState(const variable_list& vars) 
 // involving this variable know which node in the IR to reference.
 inline void setValueTrace(const std::shared_ptr<TracingState>& state, const Variable& var, Value *value) {
   JIT_ASSERT(var.defined());
-  auto vts = detail::getValueState(state, var);
-  vts->trace = value;
+  detail::tracing_state->value_map[WeakTensor(var)] = value;
 }
 
 // Given a variable 'var', return the 'node' which represents the instruction
@@ -176,13 +146,14 @@ inline Value* getValueTrace(const std::shared_ptr<TracingState>& state, const Va
     return state->graph->appendNode(n)->output();
   }
 
-  auto vts = detail::getValueState(state, var, true);
-  if (vts->trace) return vts->trace;
-
-  Value *constant = state->graph->appendNode(state->graph->createConstant(var.data()))->output();
-  constant->inferTypeFrom(var.data());
-  setValueTrace(state, var, constant);
-  return constant;
+  auto & value_map = detail::tracing_state->value_map;
+  auto it = value_map.find(WeakTensor(var));
+  if (it == value_map.end()) {
+    Value *constant = state->graph->appendNode(state->graph->createConstant(var.data()))->output();
+    constant->inferTypeFrom(var.data());
+    it = value_map.emplace_hint(it, WeakTensor(var), constant);
+  }
+  return it->second;
 }
 
 inline Value* getOutputTrace(const std::shared_ptr<TracingState>& state, const Variable& var, size_t output_no) {
@@ -191,15 +162,16 @@ inline Value* getOutputTrace(const std::shared_ptr<TracingState>& state, const V
     return state->graph->appendNode(n)->output();
   }
 
-  auto vts = detail::getValueState(state, var, false);
-  if (!vts) {
+  auto & value_map = detail::tracing_state->value_map;
+  auto it = value_map.find(WeakTensor(var));
+  if (it == value_map.end()) {
     std::ostringstream os;
     os << "output " << output_no << " of traced region did not have observable "
        << "data dependence with trace inputs; this probably indicates your program "
        << "cannot be understood by the tracer.";
     throw std::runtime_error(os.str());
   }
-  return vts->trace;
+  return it->second;
 }
 
 // Start tracing, treating 'inputs' as inputs to the trace, which can be
@@ -211,16 +183,19 @@ inline Value* getOutputTrace(const std::shared_ptr<TracingState>& state, const V
 // out of a const vector (silly std::vector...)
 inline std::pair<std::shared_ptr<TracingState>, variable_list> enter(
     variable_list inputs) {
-  auto state = std::make_shared<TracingState>();
+  if (detail::tracing_state) {
+    AT_ERROR("Tracing can't be nested");
+  }
+  auto & state = detail::tracing_state = std::make_shared<TracingState>();
   for (auto& input : inputs) {
-    auto * value_state = detail::getValueState(state, input, false);
+    auto * value_state = state->value_map[WeakTensor(input)];
     if (value_state) {
       // See Note [Repeated inputs] in tracer.cpp
       input = input.view(input.sizes());
     }
     auto input_node = state->graph->addInput(input.name());
-    setValueTrace(state, input, input_node);
     input_node->inferTypeFrom(input.data());
+    state->value_map[WeakTensor(input)] = input_node;
   }
   return std::make_pair(state, inputs);
 }
@@ -229,19 +204,17 @@ inline std::pair<std::shared_ptr<TracingState>, variable_list> enter(
 // are the variables whose values will be computed upon subsequent
 // invocations of the trace.
 inline void exit(const variable_list& outputs) {
-  auto state = getTracingState(outputs);
+  auto & state = detail::tracing_state;
   size_t i = 0;
   for (auto& output : outputs) {
     state->graph->registerOutput(getOutputTrace(state, output, i));
     i++;
   }
-  state->active = false;
 }
 
 // Pre-recorded information about the trace before we actually carry
 // out the trace
 struct PreTraceInfo {
-  std::shared_ptr<TracingState> state;
   Node *n;
 };
 
@@ -259,15 +232,14 @@ void setRecordSourceLocation(void (*v)(Node*));
 template<typename F>
 PreTraceInfo makePreTraceInfo(at::ArrayRef<Variable> inputs, F ctor) {
   PreTraceInfo info;
-  info.state = getTracingState(inputs);
-  auto& graph = info.state->graph;
-  auto state_lock = info.state->lock();
+  auto & state = detail::tracing_state;
+  auto& graph = state->graph;
 
-  Node *n = ctor(info.state, *graph);
+  Node *n = ctor(state, *graph);
   recordSourceLocation(n);
 
-  for (Variable input : inputs) {
-    n->addInput(getValueTrace(info.state, input));
+  for (const Variable & input : inputs) {
+    n->addInput(getValueTrace(state, input));
   }
 
   // NB: Order matters. This must append after inputs but before outputs.

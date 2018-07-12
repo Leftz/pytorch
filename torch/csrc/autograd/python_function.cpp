@@ -612,7 +612,6 @@ static void _trace_post_record(
 
   jit::tracer::postRecordTrace(trace_info, output_vars);
 
-  auto state_lock = trace_info.state->lock();
   trace_info.n->i_(attr::inplace, is_inplace);
 
 }
